@@ -1,0 +1,11 @@
+.env
+.bak
+.pptx
+.vscode
+.venv/
+OLD/
+outputs/
+collateral/
+outputs/
+video-demos/
+__pycache__/

@@ -1,0 +1,15 @@
+av
+azure-ai-agents
+azure-ai-projects
+azure-ai-textanalytics
+azure-cognitiveservices-speech
+azure-core
+azure-identity
+numpy
+pycaw
+pygame
+python-dotenv
+requests
+scipy
+streamlit
+streamlit-webrtc
