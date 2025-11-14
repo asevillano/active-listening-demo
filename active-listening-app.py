@@ -782,6 +782,7 @@ def main():
             'AI_LOCAL_URL': os.getenv("AI_LOCAL_URL", "Not configured"),
             'AI_SERVICE_ENDPOINT': os.getenv("AI_SERVICE_ENDPOINT", "Not configured"),
             'TEXT_LANGUAGE': os.getenv("TEXT_LANGUAGE", "en"),
+            'BROWSER_MICRO': os.getenv("BROWSER_MICRO", "false").lower() == "true"
         }
 
     # Service connection information -------------------------------------
@@ -809,8 +810,10 @@ def main():
     st.sidebar.header("Audio Input Settings")
     
     # Audio input mode selector
-    input_options = ["System Microphone", "Audio File"]
-    #input_options = ["System Microphone", "Audio File", "Browser Microphone"]
+    if st.session_state.env_cache['BROWSER_MICRO']:
+        input_options = ["System Microphone", "Audio File", "Browser Microphone"]
+    else:
+        input_options = ["System Microphone", "Audio File"]
     audio_mode = st.sidebar.radio(
         "Audio Input Source",
         options=input_options,
