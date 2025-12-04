@@ -40,6 +40,13 @@ import av
 import numpy as np
 from scipy import signal
 
+# Azure OpenAI imports
+from openai import AzureOpenAI
+import io
+import websocket
+import base64
+import json
+
 # Suppress pygame warnings before importing
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame.pkgdata")
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "1"  # Hide pygame welcome message
@@ -60,6 +67,12 @@ try:
     PYCAW_AVAILABLE = True
 except ImportError:
     PYCAW_AVAILABLE = False  
+
+# ───────────────────────── Configuration Constants ──────────────────────
+# Set to True to use Azure OpenAI gpt-4o-mini-transcribe for STT, False to use Azure Speech
+USE_OPENAI_TRANSCRIBE = True
+# Set to True to mask PII in the transcribed text, False to show original text
+MASK_PII = True
 
 # ───────────────────────── Global variables for TTS ──────────────────────
 # Simple global flag: True when TTS audio is playing
@@ -169,6 +182,11 @@ def init_services():
         "PROJECT_ENDPOINT": os.getenv("PROJECT_ENDPOINT"),
         "AGENT_ID": os.getenv("AGENT_ID"),
         "TTS_VOICE": os.getenv("TTS_VOICE", "en-US-JennyNeural"),
+        # Azure OpenAI for transcription
+        "AZURE_OPENAI_ENDPOINT": os.getenv("AZURE_OPENAI_ENDPOINT"),
+        "AZURE_OPENAI_API_KEY": os.getenv("AZURE_OPENAI_API_KEY"),
+        "AZURE_OPENAI_API_VERSION": os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
+        "AZURE_OPENAI_DEPLOYMENT": os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini-transcribe"),
     }
     
     # Convert boolean flags once
@@ -183,21 +201,39 @@ def init_services():
     #if missing_vars:
     #    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
   
-    # Setup AI Speech STT client
-    print(f"[DEBUG] Initializing Azure Speech STT client...")  # DEBUG
-    if setup_vars["DOCKER_STT"]: # Using Docker Speech container
-        stt_cfg = speech_sdk.SpeechConfig(  
-            host=setup_vars["STT_LOCAL_URL"],  
-            speech_recognition_language=setup_vars["SPEECH_LANGUAGE"],  
-        )  
-        print(f"[DEBUG] Azure Speech client ready at {setup_vars['STT_LOCAL_URL']}...")  # DEBUG
-    else: # Using Azure Speech Service in the cloud
-        stt_cfg = speech_sdk.SpeechConfig(  
-            subscription=setup_vars["SPEECH_KEY"],  
-            region=setup_vars["SPEECH_REGION"],  
-            speech_recognition_language=setup_vars["SPEECH_LANGUAGE"],  
-        )  
-        print(f"[DEBUG] Azure Speech STT client ready at {setup_vars['SPEECH_REGION']}...")  # DEBUG
+    # Setup Azure OpenAI client for transcription (if using OpenAI)
+    openai_client = None
+    if USE_OPENAI_TRANSCRIBE:
+        print(f"[DEBUG] Initializing Azure OpenAI client for transcription...")  # DEBUG
+        try:
+            openai_client = AzureOpenAI(
+                azure_endpoint=setup_vars["AZURE_OPENAI_ENDPOINT"],
+                api_key=setup_vars["AZURE_OPENAI_API_KEY"],
+                api_version=setup_vars["AZURE_OPENAI_API_VERSION"]
+            )
+            print(f"[DEBUG] Azure OpenAI client ready at {setup_vars['AZURE_OPENAI_ENDPOINT']}...")  # DEBUG
+            print(f"[DEBUG] Using deployment: {setup_vars['AZURE_OPENAI_DEPLOYMENT']}")  # DEBUG
+        except Exception as e:
+            print(f"[DEBUG] Error initializing Azure OpenAI client: {e}")
+            raise
+    
+    # Setup AI Speech STT client (only if not using OpenAI)
+    stt_cfg = None
+    if not USE_OPENAI_TRANSCRIBE:
+        print(f"[DEBUG] Initializing Azure Speech STT client...")  # DEBUG
+        if setup_vars["DOCKER_STT"]: # Using Docker Speech container
+            stt_cfg = speech_sdk.SpeechConfig(  
+                host=setup_vars["STT_LOCAL_URL"],  
+                speech_recognition_language=setup_vars["SPEECH_LANGUAGE"],  
+            )  
+            print(f"[DEBUG] Azure Speech client ready at {setup_vars['STT_LOCAL_URL']}...")  # DEBUG
+        else: # Using Azure Speech Service in the cloud
+            stt_cfg = speech_sdk.SpeechConfig(  
+                subscription=setup_vars["SPEECH_KEY"],  
+                region=setup_vars["SPEECH_REGION"],  
+                speech_recognition_language=setup_vars["SPEECH_LANGUAGE"],  
+            )  
+            print(f"[DEBUG] Azure Speech STT client ready at {setup_vars['SPEECH_REGION']}...")  # DEBUG
 
     # Setup AI Speech TTS client
     print(f"[DEBUG] Initializing Azure Speech TTS client...")  # DEBUG
@@ -217,17 +253,20 @@ def init_services():
     # Use an in-memory synthesizer (no output file)
     synthesizer = speech_sdk.SpeechSynthesizer(speech_config=tts_cfg, audio_config=None)
 
-    # Setup AI Language client
-    print("[DEBUG] Initializing Azure Language client...")  # DEBUG
-    if setup_vars["DOCKER_AI"]:  # Using Docker AI Language container
-        ai_endpoint = setup_vars["AI_LOCAL_URL"]
+    if MASK_PII:
+        # Setup AI Language client
+        print("[DEBUG] Initializing Azure Language client...")  # DEBUG
+        if setup_vars["DOCKER_AI"]:  # Using Docker AI Language container
+            ai_endpoint = setup_vars["AI_LOCAL_URL"]
+        else:
+            ai_endpoint = setup_vars["AI_SERVICE_ENDPOINT"]
+        lang_cli = TextAnalyticsClient(  
+            endpoint=ai_endpoint,  
+            credential=AzureKeyCredential(setup_vars["AI_SERVICE_KEY"]),  
+        )  
+        print(f"[DEBUG] Azure Language client ready at {ai_endpoint}...")  # DEBUG
     else:
-        ai_endpoint = setup_vars["AI_SERVICE_ENDPOINT"]
-    lang_cli = TextAnalyticsClient(  
-        endpoint=ai_endpoint,  
-        credential=AzureKeyCredential(setup_vars["AI_SERVICE_KEY"]),  
-    )  
-    print(f"[DEBUG] Azure Language client ready at {ai_endpoint}...")  # DEBUG
+        lang_cli = None
 
     # Setup AI Agents client
     print("[DEBUG] Initializing AI Agents client...")  # DEBUG
@@ -296,7 +335,9 @@ def init_services():
     thread = ag_cli.threads.create()  
     print(f"[DEBUG] AI Agents client ready at {setup_vars['PROJECT_ENDPOINT']}...")  # DEBUG
 
-    return stt_cfg, tts_cfg, lang_cli, ag_cli, agent, thread, synthesizer, setup_vars["TTS_VOICE"], agents_list  
+    return (stt_cfg, tts_cfg, lang_cli, ag_cli, agent, thread, synthesizer, 
+            setup_vars["TTS_VOICE"], agents_list, openai_client, 
+            setup_vars.get("AZURE_OPENAI_DEPLOYMENT"))  
   
   
 def mask_pii(lang_cli, text, language):  
@@ -455,12 +496,15 @@ def process_transcribed_text(text, lang_cli, language, ag_cli, agent, thread, qu
             return
         
         # Mask PII
-        print(f"[DEBUG] Calling mask_pii...")
-        start_time = time.time()
-        masked = mask_pii(lang_cli, text, language)
-        end_time = time.time()
-        print(f"[DEBUG] Masked text: '{masked}' completed in {end_time - start_time:.2f} seconds.")
-        
+        if MASK_PII:
+            print(f"[DEBUG] Calling mask_pii...")
+            start_time = time.time()
+            masked = mask_pii(lang_cli, text, language)
+            end_time = time.time()
+            print(f"[DEBUG] Masked text: '{masked}' completed in {end_time - start_time:.2f} seconds.")
+        else:
+            masked = text  # DEBUG: Skip PII masking for now
+
         # Add transcription immediately (without response yet)
         data_partial = dict(original=text, masked=masked, response="⏳ Processing...")
         queue_out.put(("add", data_partial))
@@ -541,6 +585,44 @@ def synthesize_speech(synthesizer, text, voice_name):
             return None
     except Exception as e:
         print(f"[DEBUG] Error in synthesize_speech: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def transcribe_audio_openai(openai_client, audio_data, deployment_name, language="es"):
+    """
+    Transcribes audio using Azure OpenAI gpt-4o-mini-transcribe model.
+    Returns the transcribed text or None if error.
+    
+    Args:
+        openai_client: Azure OpenAI client
+        audio_data: Audio bytes (WAV format)
+        deployment_name: Name of the Azure OpenAI deployment
+        language: Language code (e.g., 'es', 'en')
+    """
+    try:
+        print(f"[DEBUG] Starting OpenAI transcription with deployment: {deployment_name}")
+        transcription_start = time.time()
+        
+        # Create a file-like object from the audio bytes
+        audio_file = io.BytesIO(audio_data)
+        audio_file.name = "audio.wav"  # OpenAI requires a filename
+        
+        # Call the Azure OpenAI transcription API
+        result = openai_client.audio.transcriptions.create(
+            model=deployment_name,
+            file=audio_file,
+            language=language
+        )
+        
+        transcription_end = time.time()
+        print(f"[DEBUG] OpenAI transcription completed in {transcription_end - transcription_start:.2f}s")
+        print(f"[DEBUG] Transcribed text: '{result.text}'")
+        
+        return result.text
+    except Exception as e:
+        print(f"[DEBUG] Error in OpenAI transcription: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -660,15 +742,278 @@ def play_audio_file(audio_file, stop_flag):
 # ───────────────────────── 2. Recognition in thread ────────────────────────  
 def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,  
                   stt_cfg, tts_cfg, lang_cli, ag_cli, agent, thread, language, synthesizer, audio_file=None, 
-                  enable_tts=False, tts_voice=None):  
+                  enable_tts=False, tts_voice=None, openai_client=None, openai_deployment=None):  
     """  
     Background thread: listens to system microphone or processes audio file,
     and puts results in 'queue_out'. Does NOT touch the Streamlit API.
+    Supports both Azure Speech and Azure OpenAI for transcription.
     """  
     global tts_playing
     
     print("[DEBUG] Speech worker started")  # DEBUG
     
+    # If using OpenAI transcribe with audio file (using WebSocket with VAD for phrase detection)
+    if USE_OPENAI_TRANSCRIBE and audio_file and openai_client:
+        print(f"[DEBUG] Using OpenAI Realtime API with audio file: {audio_file}")
+        try:
+            import wave
+            
+            # Start audio playback in separate thread
+            playback_thread = threading.Thread(
+                target=play_audio_file,
+                args=(audio_file, stop_flag),
+                daemon=True
+            )
+            playback_thread.start()
+            
+            # Get Azure OpenAI configuration
+            openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+            openai_key = os.getenv("AZURE_OPENAI_API_KEY")
+            openai_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+            
+            # WebSocket endpoint for OpenAI Realtime API
+            ws_url = f"{openai_endpoint.replace('https', 'wss')}/openai/realtime?api-version={openai_version}&intent=transcription"
+            ws_headers = {"api-key": openai_key}
+            
+            # Open the WAV file
+            wf = wave.open(audio_file, 'rb')
+            RATE = wf.getframerate()
+            CHANNELS = wf.getnchannels()
+            
+            # Calculate chunk size for streaming (20ms chunks)
+            CHUNK_DURATION_MS = 20
+            CHUNK = int(RATE * CHUNK_DURATION_MS / 1000)
+            
+            print(f"[DEBUG] Audio file: {RATE}Hz, {CHANNELS} channels, streaming in {CHUNK_DURATION_MS}ms chunks")
+            
+            ws_connection = None
+            
+            audio_file_finished = threading.Event()
+            
+            def on_open(ws):
+                print("[DEBUG] WebSocket connected! Streaming audio file...")
+                session_config = {
+                    "type": "transcription_session.update",
+                    "session": {
+                        "input_audio_format": "pcm16",
+                        "input_audio_transcription": {
+                            "model": openai_deployment,
+                            "prompt": f"Respond in the same language as the input ({language})."
+                        },
+                        "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 200}
+                    }
+                }
+                ws.send(json.dumps(session_config))
+                
+                def stream_audio_file():
+                    try:
+                        chunk_duration = CHUNK_DURATION_MS / 1000  # 20ms en segundos
+                        
+                        while ws.keep_running and not stop_flag.is_set():
+                            audio_data = wf.readframes(CHUNK)
+                            if not audio_data:
+                                print("[DEBUG] Audio file streaming completed, waiting for final transcriptions...")
+                                audio_file_finished.set()
+                                time.sleep(2.0)  # Wait longer for final transcriptions
+                                ws.close()
+                                break
+                            
+                            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                            ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": audio_base64
+                            }))
+                            time.sleep(chunk_duration)  # Maintain real-time pace
+                    except Exception as e:
+                        print(f"[DEBUG] Audio streaming error: {e}")
+                        audio_file_finished.set()
+                        ws.close()
+                
+                threading.Thread(target=stream_audio_file, daemon=True).start()
+            
+            phrases_processed = [0]  # Use list to allow modification in nested function
+            
+            def on_message(ws, message):
+                try:
+                    data = json.loads(message)
+                    event_type = data.get("type", "")
+                    
+                    # Transcripción completa (detectada por VAD - silencio)
+                    if event_type == "conversation.item.input_audio_transcription.completed":
+                        text = data.get("transcript", "")
+                        if text and text.strip():
+                            phrases_processed[0] += 1
+                            print(f"[DEBUG] Phrase {phrases_processed[0]} detected by VAD: {text}")
+                            process_transcribed_text(
+                                text, lang_cli, language, ag_cli, agent, thread, queue_out,
+                                enable_tts=False, synthesizer=synthesizer,
+                                tts_voice=tts_voice, stop_flag=stop_flag
+                            )
+                except Exception as e:
+                    print(f"[DEBUG] Error processing message: {e}")
+            
+            def on_error(ws, error):
+                print(f"[DEBUG] WebSocket error: {error}")
+            
+            def on_close(ws, close_status_code, close_msg):
+                print("[DEBUG] WebSocket disconnected")
+                wf.close()
+            
+            ws_connection = websocket.WebSocketApp(
+                ws_url,
+                header=ws_headers,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            
+            # Run WebSocket in a thread
+            ws_thread = threading.Thread(target=ws_connection.run_forever, daemon=True)
+            ws_thread.start()
+            
+            # Wait for WebSocket to finish or stop signal
+            ws_thread.join()
+            
+            # Wait for audio playback to finish
+            if playback_thread and playback_thread.is_alive():
+                playback_thread.join()
+                
+        except Exception as e:
+            print(f"[DEBUG] Error in OpenAI Realtime API with file: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print("[DEBUG] Speech worker stopped")
+        return
+    
+    # If using OpenAI transcribe with microphone (use WebSocket Realtime API)
+    if USE_OPENAI_TRANSCRIBE and not audio_file and openai_client:
+        print("[DEBUG] Using Azure OpenAI Realtime API for microphone transcription")
+        print("[DEBUG] Starting WebSocket connection...")
+        
+        try:
+            import pyaudio
+            
+            # Get Azure OpenAI configuration
+            openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+            openai_key = os.getenv("AZURE_OPENAI_API_KEY")
+            openai_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+            
+            # WebSocket endpoint for OpenAI Realtime API
+            ws_url = f"{openai_endpoint.replace('https', 'wss')}/openai/realtime?api-version={openai_version}&intent=transcription"
+            ws_headers = {"api-key": openai_key}
+            
+            # Audio parameters
+            RATE = 24000
+            CHANNELS = 1
+            FORMAT = pyaudio.paInt16
+            CHUNK_DURATION_MS = 20
+            CHUNK = int(RATE * CHUNK_DURATION_MS / 1000)
+            
+            # Initialize pyaudio
+            p = pyaudio.PyAudio()
+            audio_stream = p.open(format=FORMAT,
+                                channels=CHANNELS,
+                                rate=RATE,
+                                input=True,
+                                frames_per_buffer=CHUNK)
+            
+            ws_connection = None
+            
+            def on_open(ws):
+                print("[DEBUG] WebSocket connected! Start speaking...")
+                session_config = {
+                    "type": "transcription_session.update",
+                    "session": {
+                        "input_audio_format": "pcm16",
+                        "input_audio_transcription": {
+                            "model": openai_deployment,
+                            "prompt": f"Respond in the same language as the input ({language})."
+                        },
+                        "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 200}
+                    }
+                }
+                ws.send(json.dumps(session_config))
+                
+                def stream_microphone():
+                    try:
+                        while ws.keep_running and not stop_flag.is_set():
+                            audio_data = audio_stream.read(CHUNK, exception_on_overflow=False)
+                            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                            ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": audio_base64
+                            }))
+                    except Exception as e:
+                        print(f"[DEBUG] Audio streaming error: {e}")
+                        ws.close()
+                
+                threading.Thread(target=stream_microphone, daemon=True).start()
+            
+            def on_message(ws, message):
+                try:
+                    data = json.loads(message)
+                    event_type = data.get("type", "")
+                    
+                    # Transcripción completa
+                    if event_type == "conversation.item.input_audio_transcription.completed":
+                        text = data.get("transcript", "")
+                        if text and text.strip():
+                            print(f"[DEBUG] Transcribed with gpt-4o-mini-transcribe: {text}")
+                            process_transcribed_text(
+                                text, lang_cli, language, ag_cli, agent, thread, queue_out,
+                                enable_tts=enable_tts, synthesizer=synthesizer,
+                                tts_voice=tts_voice, stop_flag=stop_flag
+                            )
+                except Exception as e:
+                    print(f"[DEBUG] Error processing message: {e}")
+            
+            def on_error(ws, error):
+                print(f"[DEBUG] WebSocket error: {error}")
+            
+            def on_close(ws, close_status_code, close_msg):
+                print("[DEBUG] WebSocket disconnected")
+                audio_stream.stop_stream()
+                audio_stream.close()
+                p.terminate()
+            
+            ws_connection = websocket.WebSocketApp(
+                ws_url,
+                header=ws_headers,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            
+            # Run WebSocket in a thread
+            ws_thread = threading.Thread(target=ws_connection.run_forever, daemon=True)
+            ws_thread.start()
+            
+            # Wait for stop signal
+            while not stop_flag.is_set():
+                time.sleep(0.2)
+            
+            # Close WebSocket
+            if ws_connection:
+                ws_connection.close()
+            
+            ws_thread.join(timeout=2)
+            
+        except ImportError:
+            print("[DEBUG] ERROR: pyaudio or websocket-client not installed")
+            print("[DEBUG] Install with: pip install pyaudio websocket-client")
+            print("[DEBUG] Or use audio file mode or set USE_OPENAI_TRANSCRIBE = False")
+        except Exception as e:
+            print(f"[DEBUG] Error in OpenAI Realtime API transcription: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print("[DEBUG] Speech worker stopped")
+        return
+    
+    # Original Azure Speech logic
     # If using an audio file, start playback in a separate thread
     playback_thread = None
     if audio_file:
@@ -748,14 +1093,22 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
 
 def browser_audio_worker(queue_out: queue.Queue, stop_flag: threading.Event,
                         stt_cfg, lang_cli, ag_cli, agent, thread, language, synthesizer, tts_voice,
-                        audio_queue: queue.Queue, enable_tts=False):
+                        audio_queue: queue.Queue, enable_tts=False, openai_client=None, openai_deployment=None):
     """
     Background thread: processes browser audio in real-time using PushAudioInputStream.
     Receives audio chunks from audio_queue and sends them to the recognizer.
+    Supports both Azure Speech and Azure OpenAI for transcription.
     """
     global tts_playing
     
     print("[DEBUG] Browser audio worker started")
+    
+    # If using OpenAI transcribe (not supported for streaming)
+    if USE_OPENAI_TRANSCRIBE:
+        print("[DEBUG] ERROR: OpenAI transcription with browser microphone not supported")
+        print("[DEBUG] Real-time streaming transcription requires Azure Speech SDK")
+        print("[DEBUG] Please set USE_OPENAI_TRANSCRIBE = False for browser microphone mode")
+        return
     
     try:
         # Create a PushAudioInputStream with the correct format
@@ -779,6 +1132,7 @@ def browser_audio_worker(queue_out: queue.Queue, stop_flag: threading.Event,
         def recognized_cb(evt: speech_sdk.SpeechRecognitionEventArgs):
             """Final recognition event"""
             text = evt.result.text.strip()
+            print(f"[DEBUG] Transcribed with Azure Speech: '{text}'")
             
             # Check if there was an error
             if evt.result.reason == speech_sdk.ResultReason.NoMatch:
@@ -875,7 +1229,11 @@ def browser_audio_worker(queue_out: queue.Queue, stop_flag: threading.Event,
 def main():  
     # Configure the page to use full width
     st.set_page_config(layout="wide", page_title="Active Listening Demo", page_icon="🎤")
-    st.title("🎤 Active Listening Demo with PII Masking")
+    if MASK_PII:
+        st.title("🎤 Active Listening Demo with PII Masking")
+    else:
+        st.title("🎤 Active Listening Demo")
+
     warnings.filterwarnings("ignore",  
                             message="Thread .*: missing ScriptRunContext",  
                             category=RuntimeWarning)  
@@ -889,7 +1247,8 @@ def main():
             init_pygame_mixer()
             
             (stt_cfg, tts_cfg, lang_cli, ag_cli,  
-             agent, thread, synthesizer, tts_voice, agents_list) = init_services()  
+             agent, thread, synthesizer, tts_voice, agents_list,
+             openai_client, openai_deployment) = init_services()  
         except ValueError as e:
             st.error(f"❌ Configuration Error: {str(e)}")
             st.info("💡 Please check your .env file and ensure all required environment variables are set.")
@@ -916,6 +1275,8 @@ def main():
         st.session_state.enable_tts  = False
         st.session_state.agents_list = agents_list
         st.session_state.selected_agent_id = agent.id if agent else None
+        st.session_state.openai_client = openai_client
+        st.session_state.openai_deployment = openai_deployment
     
     # Initialize audio_queue as global variable (not in session_state due to thread issues)
     if not hasattr(st.session_state, 'audio_queue_instance'):
@@ -940,7 +1301,9 @@ def main():
     st.sidebar.header("Service Connection Info")
     
     # Azure AI Speech STT information
-    if st.session_state.env_cache['DOCKER_STT']:
+    if USE_OPENAI_TRANSCRIBE:
+        st.sidebar.text(f"🎤 STT: Azure OpenAI (gpt-4o-mini-transcribe)")
+    elif st.session_state.env_cache['DOCKER_STT']:
         st.sidebar.text(f"🎤 AI Speech STT (Docker): {st.session_state.env_cache['STT_LOCAL_URL']}")
     else:
         st.sidebar.text(f"🎤 AI Speech STT (Cloud): Region: {st.session_state.env_cache['SPEECH_REGION']}")
@@ -1200,7 +1563,9 @@ def main():
                           st.session_state.synthesizer,
                           st.session_state.tts_voice,
                           st.session_state.audio_queue_instance,
-                          st.session_state.enable_tts),
+                          st.session_state.enable_tts,
+                          st.session_state.openai_client,
+                          st.session_state.openai_deployment),
                     daemon=True,
                 )
                 st.session_state.worker.start()
@@ -1242,7 +1607,9 @@ def main():
                           st.session_state.synthesizer,
                           audio_file_path if audio_mode == "Audio File" else None,
                           st.session_state.enable_tts,
-                          st.session_state.tts_voice),
+                          st.session_state.tts_voice,
+                          st.session_state.openai_client,
+                          st.session_state.openai_deployment),
                     daemon=True,  
                 )
                     
@@ -1288,8 +1655,11 @@ def main():
   
     #print(f"[DEBUG] Rendering UI with {len(st.session_state.records)} records")  # DEBUG
     
-    with left:  
-        st.subheader("Original transcription")  
+    with left:
+        if MASK_PII:
+            st.subheader("Original transcription")
+        else:
+            st.subheader("Transcription")
         # Scrollable container to show original transcriptions
         with st.container(height=300):
             if st.session_state.records:
@@ -1302,17 +1672,18 @@ def main():
             else:
                 st.info("Waiting for speech input...")
   
-        st.subheader("Masked transcription")  
-        # Scrollable container to show masked transcriptions
-        with st.container(height=300):
-            if st.session_state.records:
-                # Reverse order to show most recent first
-                for i, rec in enumerate(reversed(st.session_state.records)):  
-                    actual_index = len(st.session_state.records) - i
-                    st.markdown(f"**{actual_index}.** {rec['masked']}")  
-                    st.divider()
-            else:
-                st.info("Waiting for speech input...")
+        if MASK_PII:
+            st.subheader("Masked transcription")  
+            # Scrollable container to show masked transcriptions
+            with st.container(height=300):
+                if st.session_state.records:
+                    # Reverse order to show most recent first
+                    for i, rec in enumerate(reversed(st.session_state.records)):  
+                        actual_index = len(st.session_state.records) - i
+                        st.markdown(f"**{actual_index}.** {rec['masked']}")  
+                        st.divider()
+                else:
+                    st.info("Waiting for speech input...")
   
     with right:  
         st.subheader("Agent response")  

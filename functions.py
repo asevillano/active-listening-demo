@@ -65,7 +65,7 @@ PII_CATEGORIES = [PiiEntityCategory.ADDRESS,
 
 # Configure solution
 def init_config():
-    DOCKER_SPEECH   = os.getenv("DOCKER_SPEECH", "true").lower() == "true"
+    DOCKER_SPEECH   = os.getenv("DOCKER_STT", "true").lower() == "true"
     DOCKER_AI       = os.getenv("DOCKER_AI", "true").lower() == "true"
     SPEECH_LANGUAGE = os.getenv("SPEECH_LANGUAGE")
     TEXT_LANGUAGE   = os.getenv("TEXT_LANGUAGE")

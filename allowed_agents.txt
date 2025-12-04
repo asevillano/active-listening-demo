@@ -1,6 +1,7 @@
 # Lista de agentes permitidos para mostrar en la aplicación (un nombre de agente por línea)
+#active-listening-contoso-bank
+#active-listening-contoso-bank-RAG
 
-active-listening-contoso-bank
-active-listening-contoso-bank-RAG
+active-listening-qa-telf
 active-listening-generic
 weather-assistant
