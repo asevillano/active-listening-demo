@@ -122,7 +122,7 @@ DOCKER_AI=true
 
 run `python active-listening.py`
 
-**Option 2: Demo of audio conversation processing from audio file without a web interface**
+**Option 2: Demo of audio conversation processing from audio file with Speaker identification, without a web interface**
 
 run `python active-listening-conversation.py`
 
