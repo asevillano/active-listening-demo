@@ -43,6 +43,7 @@ from functions import *
 import pygame
 
 def play_audio(file_path):
+    print(f"Playing audio file... {file_path}\n")
     # Inicializar el mixer de pygame
     pygame.mixer.init()
     # Cargar el archivo WAV
@@ -67,10 +68,12 @@ def main():
         agents_client, agent, thread = init_agents()
 
         # Process conversation from file
-        FILE_NAME = "audio_files/Live Answering Service Sample Call - Appointment Setting.wav"
+        #FILE_NAME = "audio_files/Live Answering Service Sample Call - Appointment Setting.wav"
         #FILE_NAME = "audio_files/Sample Order Taking Customer Support Philippines.wav"
         #FILE_NAME = "audio_files/Customer Service Sample Call - Product Refund.wav"
         #FILE_NAME = "audio_files/callCenterRecording.wav" #"audio_files/AUD-20250902-WA0001.wav" #"audio_files/katiesteve.wav"
+        #FILE_NAME = "audio_files/20251117-115218_645744755_123.wav"
+        FILE_NAME = "audio_files/20251117-132519-dump-bea9b8ee-abd0-4071-a2c7-783d58d9d89b.wav"
 
         # Play audio file        
         play_audio(FILE_NAME)
