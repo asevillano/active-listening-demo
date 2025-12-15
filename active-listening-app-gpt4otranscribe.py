@@ -72,7 +72,7 @@ except ImportError:
 # Set to True to use Azure OpenAI gpt-4o-mini-transcribe for STT, False to use Azure Speech
 USE_OPENAI_TRANSCRIBE = True
 # Set to True to mask PII in the transcribed text, False to show original text
-MASK_PII = True
+MASK_PII = False
 
 # ───────────────────────── Global variables for TTS ──────────────────────
 # Simple global flag: True when TTS audio is playing
@@ -758,6 +758,12 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
         try:
             import wave
             
+            # Initialize pygame mixer BEFORE starting playback to avoid delays
+            print("[DEBUG] Initializing pygame mixer for audio playback...")
+            if not init_pygame_mixer():
+                print("[DEBUG] ERROR: Failed to initialize pygame mixer")
+                return
+            
             # Start audio playback in separate thread
             playback_thread = threading.Thread(
                 target=play_audio_file,
@@ -780,8 +786,8 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
             RATE = wf.getframerate()
             CHANNELS = wf.getnchannels()
             
-            # Calculate chunk size for streaming (20ms chunks)
-            CHUNK_DURATION_MS = 20
+            # Calculate chunk size for streaming (100ms chunks for better performance)
+            CHUNK_DURATION_MS = 100
             CHUNK = int(RATE * CHUNK_DURATION_MS / 1000)
             
             print(f"[DEBUG] Audio file: {RATE}Hz, {CHANNELS} channels, streaming in {CHUNK_DURATION_MS}ms chunks")
@@ -800,21 +806,22 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
                             "model": openai_deployment,
                             "prompt": f"Respond in the same language as the input ({language})."
                         },
-                        "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 200}
+                        "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 500, "silence_duration_ms": 700}
                     }
                 }
                 ws.send(json.dumps(session_config))
                 
                 def stream_audio_file():
                     try:
-                        chunk_duration = CHUNK_DURATION_MS / 1000  # 20ms en segundos
+                        # Stream faster than real-time (50% speed) for quicker processing
+                        chunk_duration = (CHUNK_DURATION_MS / 1000) * 0.5
                         
                         while ws.keep_running and not stop_flag.is_set():
                             audio_data = wf.readframes(CHUNK)
                             if not audio_data:
                                 print("[DEBUG] Audio file streaming completed, waiting for final transcriptions...")
                                 audio_file_finished.set()
-                                time.sleep(2.0)  # Wait longer for final transcriptions
+                                time.sleep(3.0)  # Wait longer for final transcriptions
                                 ws.close()
                                 break
                             
@@ -823,7 +830,7 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
                                 "type": "input_audio_buffer.append",
                                 "audio": audio_base64
                             }))
-                            time.sleep(chunk_duration)  # Maintain real-time pace
+                            time.sleep(chunk_duration)  # Stream faster than real-time
                     except Exception as e:
                         print(f"[DEBUG] Audio streaming error: {e}")
                         audio_file_finished.set()
@@ -843,12 +850,19 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
                         text = data.get("transcript", "")
                         if text and text.strip():
                             phrases_processed[0] += 1
-                            print(f"[DEBUG] Phrase {phrases_processed[0]} detected by VAD: {text}")
+                            print(f"\n{'='*60}")
+                            print(f"[DEBUG] 🎯 FRASE {phrases_processed[0]} DETECTADA (por silencio VAD)")
+                            print(f"[DEBUG] Transcripción: '{text}'")
+                            print(f"[DEBUG] Procesando y enviando al agente...")
+                            print(f"{'='*60}\n")
                             process_transcribed_text(
                                 text, lang_cli, language, ag_cli, agent, thread, queue_out,
                                 enable_tts=False, synthesizer=synthesizer,
                                 tts_voice=tts_voice, stop_flag=stop_flag
                             )
+                    # Debug: mostrar otros tipos de eventos relevantes
+                    elif event_type in ["input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"]:
+                        print(f"[DEBUG] VAD event: {event_type}")
                 except Exception as e:
                     print(f"[DEBUG] Error processing message: {e}")
             
