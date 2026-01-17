@@ -9,9 +9,9 @@ This application demonstrates a real-time active listening system that:
    - Browser microphone (using WebRTC)
 
 2. Processes audio using Azure AI services:
-   - Azure AI Speech: Transcribes audio to text in real-time
-   - Azure AI Language: Detects and masks personally identifiable information (PII)
+   - GPT-4o-mini-transcribe: Transcribes audio to text in real-time
    - Azure AI Agents: Generates intelligent responses based on context
+   - Azure OpenAI (configurable model): Generates conversation summaries and topic categorization
 
 3. Key features:
    - Interactive web interface built with Streamlit
@@ -19,17 +19,24 @@ This application demonstrates a real-time active listening system that:
    - Support for local Docker containers or cloud services
    - Automatic masking of sensitive data (names, addresses, phone numbers, etc.)
    - Visualization in separate columns: original text, masked text, and agent responses
+   - Automatic conversation summary and topic categorization when stopping or completing audio processing
 
 4. Use cases:
    - Conversational AI demonstrations
    - Customer service systems with privacy protection
    - Real-time conversation analysis
    - Voice-enabled virtual assistants
+   - Post-call analytics and categorization
+
+5. Environment variables:
+   - AZURE_OPENAI_DEPLOYMENT_FOR_SUMMARY: Model deployment for summaries (default: gpt-4.1-mini)
+   - See .env file for complete configuration
 
 Author: Angel Sevillano (Microsoft)
 Version: 2025
 """
 
+from ast import If
 import re
 import os, time, threading, queue, warnings  
 from dotenv import load_dotenv  
@@ -73,6 +80,8 @@ except ImportError:
 USE_OPENAI_TRANSCRIBE = True
 # Set to True to mask PII in the transcribed text, False to show original text
 MASK_PII = False
+# Categories for conversation topic classification
+CONVERSATION_CATEGORIES = ["Invoices", "Products"]
 
 # ───────────────────────── Global variables for TTS ──────────────────────
 # Simple global flag: True when TTS audio is playing
@@ -187,6 +196,7 @@ def init_services():
         "AZURE_OPENAI_API_KEY": os.getenv("AZURE_OPENAI_API_KEY"),
         "AZURE_OPENAI_API_VERSION": os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
         "AZURE_OPENAI_DEPLOYMENT": os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini-transcribe"),
+        "AZURE_OPENAI_DEPLOYMENT_FOR_SUMMARY": os.getenv("AZURE_OPENAI_DEPLOYMENT_FOR_SUMMARY", "gpt-4.1-mini"),
     }
     
     # Convert boolean flags once
@@ -337,7 +347,8 @@ def init_services():
 
     return (stt_cfg, tts_cfg, lang_cli, ag_cli, agent, thread, synthesizer, 
             setup_vars["TTS_VOICE"], agents_list, openai_client, 
-            setup_vars.get("AZURE_OPENAI_DEPLOYMENT"))  
+            setup_vars.get("AZURE_OPENAI_DEPLOYMENT"),
+            setup_vars.get("AZURE_OPENAI_DEPLOYMENT_FOR_SUMMARY"))  
   
   
 def mask_pii(lang_cli, text, language):  
@@ -454,6 +465,87 @@ def ask_agent(ag_cli, agent_id, thread_id, content, stream_callback=None):
         import traceback
         traceback.print_exc()
         return f"⚠️ Error: {str(e)}"  
+
+
+def generate_conversation_summary(openai_client, records, categories, deployment_name="gpt-4.1-mini"):
+    """
+    Generates a summary and topic categorization for the complete conversation
+    using Azure OpenAI model specified by deployment_name.
+    
+    Args:
+        openai_client: Azure OpenAI client
+        records: List of conversation records with 'original' and 'response' keys
+        categories: List of valid categories for classification
+        deployment_name: Azure OpenAI deployment name for the model (default: gpt-4.1-mini)
+    
+    Returns:
+        Tuple of (summary_text, categories_found)
+    """
+    if not records:
+        return "No conversation to summarize.", []
+    
+    if not openai_client:
+        return "Error: Azure OpenAI client not available.", []
+    
+    try:
+        # Build the full conversation text
+        conversation_text = "\n".join([
+            f"User: {rec.get('original', '')}\nAgent: {rec.get('response', '')}"
+            for rec in records
+        ])
+        
+        # Create prompt for summary and categorization
+        categories_str = ", ".join(categories)
+        prompt = f"""Analiza la siguiente conversación y proporciona:
+
+1. **RESUMEN**: Un resumen conciso de los temas principales tratados en la conversación (máximo 3-4 oraciones).
+
+2. **CATEGORÍAS**: Clasifica los temas tratados SOLO entre las siguientes categorías válidas: {categories_str}
+   - Lista ÚNICAMENTE las categorías que aplican a esta conversación.
+   - Si ninguna categoría aplica, indica "Ninguna categoría aplicable".
+
+Formato de respuesta:
+**Resumen:**
+[Tu resumen aquí]
+
+**Categorías detectadas:**
+[Lista de categorías que aplican]
+
+---
+CONVERSACIÓN:
+{conversation_text}
+---"""
+        
+        print(f"[DEBUG] Generating conversation summary with {deployment_name}...")
+        
+        # Use Azure OpenAI model for the summary
+        response = openai_client.chat.completions.create(
+            model=deployment_name,  # Deployment name from environment variable
+            messages=[
+                {"role": "system", "content": "Eres un asistente experto en análisis y resumen de conversaciones."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1000
+        )
+        
+        summary_response = response.choices[0].message.content
+        
+        print(f"[DEBUG] Summary generated: {summary_response[:200]}...")
+        
+        # Extract detected categories from response
+        detected_categories = []
+        for cat in categories:
+            if cat.lower() in summary_response.lower():
+                detected_categories.append(cat)
+        
+        return summary_response, detected_categories
+        
+    except Exception as e:
+        print(f"[DEBUG] Error generating summary: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"Error generating summary: {str(e)}", []
 
 
 def should_discard_tts_echo(text):
@@ -804,7 +896,8 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
                         "input_audio_format": "pcm16",
                         "input_audio_transcription": {
                             "model": openai_deployment,
-                            "prompt": f"Respond in the same language as the input ({language})."
+                            "prompt": f"Respond in Spanish."
+                            #"prompt": f"Respond in the same language as the input ({language})."
                         },
                         "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 500, "silence_duration_ms": 700}
                     }
@@ -892,6 +985,10 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
             # Wait for audio playback to finish
             if playback_thread and playback_thread.is_alive():
                 playback_thread.join()
+            
+            # Signal that the audio file processing has finished
+            queue_out.put(("file_finished", None))
+            print("[DEBUG] Audio file processing completed, sent file_finished signal")
                 
         except Exception as e:
             print(f"[DEBUG] Error in OpenAI Realtime API with file: {e}")
@@ -943,7 +1040,8 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
                         "input_audio_format": "pcm16",
                         "input_audio_transcription": {
                             "model": openai_deployment,
-                            "prompt": f"Respond in the same language as the input ({language})."
+                            "prompt": f"Respond in Spanish."
+                            #"prompt": f"Respond in the same language as the input ({language})."
                         },
                         "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 200}
                     }
@@ -1084,8 +1182,13 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
     recognizer.start_continuous_recognition()  
     print("[DEBUG] Continuous recognition started")  # DEBUG
   
-    # Wait until the 'stop_flag' signal is activated
-    while not stop_flag.is_set():  
+    # Wait until the 'stop_flag' signal is activated OR audio file finishes
+    while not stop_flag.is_set():
+        # If processing an audio file, check if playback has finished
+        if audio_file and playback_thread and not playback_thread.is_alive():
+            print("[DEBUG] Audio file playback finished, waiting for final transcriptions...")
+            time.sleep(2.0)  # Wait for final transcriptions to be processed
+            break
         time.sleep(0.2)  
   
     print("[DEBUG] Stopping recognition...")  # DEBUG
@@ -1098,6 +1201,11 @@ def speech_worker(queue_out: queue.Queue, stop_flag: threading.Event,
     if playback_thread and playback_thread.is_alive():
         print("[DEBUG] Waiting for audio playback to stop...")
         playback_thread.join(timeout=2)  # Wait maximum 2 seconds
+    
+    # If processing an audio file, signal that it's finished
+    if audio_file:
+        queue_out.put(("file_finished", None))
+        print("[DEBUG] Audio file processing completed, sent file_finished signal")
     
     # Ensure the microphone is unmuted when stopping the worker
     unmute_microphone()
@@ -1262,7 +1370,7 @@ def main():
             
             (stt_cfg, tts_cfg, lang_cli, ag_cli,  
              agent, thread, synthesizer, tts_voice, agents_list,
-             openai_client, openai_deployment) = init_services()  
+             openai_client, openai_deployment, openai_summary_deployment) = init_services()  
         except ValueError as e:
             st.error(f"❌ Configuration Error: {str(e)}")
             st.info("💡 Please check your .env file and ensure all required environment variables are set.")
@@ -1291,6 +1399,7 @@ def main():
         st.session_state.selected_agent_id = agent.id if agent else None
         st.session_state.openai_client = openai_client
         st.session_state.openai_deployment = openai_deployment
+        st.session_state.openai_summary_deployment = openai_summary_deployment
     
     # Initialize audio_queue as global variable (not in session_state due to thread issues)
     if not hasattr(st.session_state, 'audio_queue_instance'):
@@ -1326,13 +1435,15 @@ def main():
     if st.session_state.env_cache['DOCKER_TTS']:
         st.sidebar.text(f"🎤 AI Speech TTS (Docker): {st.session_state.env_cache['TTS_LOCAL_URL']}")
     else:
-        st.sidebar.text(f"🎤 AI Speech TTS (Cloud): Region: {st.session_state.env_cache['SPEECH_REGION']}")
+        if False: # OCULTAR PARA LA DEMO DE TELF
+            st.sidebar.text(f"🎤 AI Speech TTS (Cloud): Region: {st.session_state.env_cache['SPEECH_REGION']}")
 
     # Azure AI Language information
     if st.session_state.env_cache['DOCKER_AI']:
         st.sidebar.text(f"🔤 AI Language (Docker): {st.session_state.env_cache['AI_LOCAL_URL']}")
     else:
-        st.sidebar.text(f"🔤 AI Language (Cloud): {st.session_state.env_cache['AI_SERVICE_ENDPOINT']}")
+        if False: # OCULTAR PARA LA DEMO DE TELF
+            st.sidebar.text(f"🔤 AI Language (Cloud): {st.session_state.env_cache['AI_SERVICE_ENDPOINT']}")
 
     # AI Agent selection -------------------------------------------
     st.sidebar.header("AI Agent Settings")
@@ -1429,17 +1540,18 @@ def main():
     
     # Checkbox for Text-to-Speech (only if not using audio file)
     if audio_mode != "Audio File":
-        st.sidebar.header("Text-to-Speech Settings")
-        enable_tts = st.sidebar.checkbox(
-            "Enable TTS for agent responses",
-            value=st.session_state.enable_tts,
-            disabled=st.session_state.running,
-            help=f"Synthesize agent responses using voice: {st.session_state.tts_voice}"
-        )
-        st.session_state.enable_tts = enable_tts
-        
-        if enable_tts:
-            st.sidebar.info(f"🔊 Voice: {st.session_state.tts_voice}")
+        if False: # OCULTAR PARA LA DEMO DE TELF
+            st.sidebar.header("Text-to-Speech Settings")
+            enable_tts = st.sidebar.checkbox(
+                "Enable TTS for agent responses",
+                value=st.session_state.enable_tts,
+                disabled=st.session_state.running,
+                help=f"Synthesize agent responses using voice: {st.session_state.tts_voice}"
+            )
+            st.session_state.enable_tts = enable_tts
+            
+            if enable_tts:
+                st.sidebar.info(f"🔊 Voice: {st.session_state.tts_voice}")
     else:
         # Disable TTS when using a file
         st.session_state.enable_tts = False
@@ -1633,11 +1745,25 @@ def main():
             if col_btn.button("⏹ Stop", type="secondary"):  
                 st.session_state.stop_flag.set()  
                 st.session_state.running = False
+                
+                # Generate conversation summary if there are records
+                if st.session_state.records:
+                    with st.spinner("Generando resumen de la conversación..."):
+                        summary, detected_cats = generate_conversation_summary(
+                            st.session_state.openai_client,
+                            st.session_state.records,
+                            CONVERSATION_CATEGORIES,
+                            st.session_state.openai_summary_deployment
+                        )
+                        st.session_state.conversation_summary = summary
+                        st.session_state.detected_categories = detected_cats
+                
                 # Force immediate UI refresh to show Start button
                 st.rerun()
     
     # Empty the results queue coming from threads -----------------------  
     new_items = 0
+    file_finished = False
     while not st.session_state.queue.empty():  
         message = st.session_state.queue.get()
         
@@ -1653,11 +1779,30 @@ def main():
                 if st.session_state.records:
                     st.session_state.records[-1]["response"] = data
                     #print(f"[DEBUG] Updated last record with agent response")  # DEBUG
+            elif action == "file_finished":
+                # Audio file processing completed - trigger summary generation
+                print("[DEBUG] Received file_finished signal, will generate summary")
+                file_finished = True
         else:
             # Compatibility with old format (just in case)
             st.session_state.records.append(message)
             new_items += 1
             #print(f"[DEBUG] Added complete record: {message}")  # DEBUG
+    
+    # If audio file finished processing, generate summary automatically
+    if file_finished and st.session_state.records:
+        st.session_state.stop_flag.set()
+        st.session_state.running = False
+        with st.spinner("Generando resumen de la conversación..."):
+            summary, detected_cats = generate_conversation_summary(
+                st.session_state.openai_client,
+                st.session_state.records,
+                CONVERSATION_CATEGORIES,
+                st.session_state.openai_summary_deployment
+            )
+            st.session_state.conversation_summary = summary
+            st.session_state.detected_categories = detected_cats
+        st.rerun()
     
     #if new_items > 0:
     #    print(f"[DEBUG] Added {new_items} new items. Total records: {len(st.session_state.records)}")  # DEBUG
@@ -1711,6 +1856,34 @@ def main():
                     st.divider()
             else:
                 st.info("Waiting for speech input...")
+
+    # Display conversation summary if available (after stopping)
+    if hasattr(st.session_state, 'conversation_summary') and st.session_state.conversation_summary:
+        st.divider()
+        st.header("📋 Resumen de la Conversación")
+        
+        # Show detected categories as tags
+        if hasattr(st.session_state, 'detected_categories') and st.session_state.detected_categories:
+            st.subheader("🏷️ Categorías detectadas:")
+            cols = st.columns(len(st.session_state.detected_categories))
+            for i, cat in enumerate(st.session_state.detected_categories):
+                with cols[i]:
+                    st.success(f"✅ {cat}")
+        else:
+            st.info("No se detectaron categorías específicas en esta conversación.")
+        
+        # Show the full summary
+        st.subheader("📝 Resumen:")
+        st.markdown(st.session_state.conversation_summary)
+        
+        # Button to clear the summary and start fresh
+        if st.button("🗑️ Limpiar resumen y empezar nueva conversación"):
+            st.session_state.conversation_summary = None
+            st.session_state.detected_categories = None
+            st.session_state.records = []
+            # Create a new thread for the next conversation
+            st.session_state.thread = st.session_state.ag_cli.threads.create()
+            st.rerun()
 
     # Auto-refresh while recording
     if st.session_state.running:  
